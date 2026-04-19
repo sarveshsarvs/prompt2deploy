@@ -76,6 +76,7 @@ function App() {
   const [generationLoading, setGenerationLoading] = useState(false);
   const [generatedWithModel, setGeneratedWithModel] = useState("");
   const [selectedFilePath, setSelectedFilePath] = useState("");
+  const [downloadLoading, setDownloadLoading] = useState(false);
 
   useEffect(() => {
     const savedUser = window.localStorage.getItem(storageKey);
@@ -139,6 +140,7 @@ function App() {
     setGenerationError("");
     setGeneratedWithModel("");
     setSelectedFilePath("");
+    setDownloadLoading(false);
     resetFeedback();
     setMode("login");
   };
@@ -170,6 +172,49 @@ function App() {
       setGenerationError(generationRequestError.message);
     } finally {
       setGenerationLoading(false);
+    }
+  };
+
+  const handleDownload = async () => {
+    if (!projectPlan) {
+      return;
+    }
+
+    setGenerationError("");
+    setDownloadLoading(true);
+
+    try {
+      const response = await fetch("/api/export", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ projectPlan }),
+      });
+
+      if (!response.ok) {
+        const payload = await response.json();
+        throw new Error(payload.message || "Unable to download project.");
+      }
+
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      const projectName = (projectPlan.projectName || "generated-project")
+        .toLowerCase()
+        .replace(/[^a-z0-9-_]+/g, "-")
+        .replace(/^-+|-+$/g, "");
+
+      link.href = url;
+      link.download = `${projectName || "generated-project"}.zip`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (downloadError) {
+      setGenerationError(downloadError.message);
+    } finally {
+      setDownloadLoading(false);
     }
   };
 
@@ -248,6 +293,14 @@ function App() {
                   {generatedWithModel ? (
                     <span className="model-badge">{generatedWithModel}</span>
                   ) : null}
+                  <button
+                    className="secondary-button"
+                    type="button"
+                    onClick={handleDownload}
+                    disabled={downloadLoading}
+                  >
+                    {downloadLoading ? "Preparing ZIP..." : "Download ZIP"}
+                  </button>
                 </div>
 
                 <div className="dependency-card">
