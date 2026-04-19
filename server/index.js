@@ -15,8 +15,9 @@ const usersFilePath = path.join(__dirname, "users.json");
 const distPath = path.join(__dirname, "..", "dist");
 const app = express();
 const port = 4000;
-const groqApiUrl = "https://api.groq.com/openai/v1/chat/completions";
+const groqApiUrl = "https://api.groq.com/openai/v1/responses";
 const groqModel = process.env.GROQ_MODEL || "openai/gpt-oss-20b";
+const maxGroqRetries = 3;
 
 app.use(cors());
 app.use(express.json());
@@ -46,68 +47,180 @@ function sanitizeUser(user) {
   };
 }
 
-async function generateProjectPlan(prompt) {
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function buildResponsesInput(messages) {
+  return messages.map((message) => ({
+    role: message.role,
+    content: [
+      {
+        type: "input_text",
+        text: message.content,
+      },
+    ],
+  }));
+}
+
+async function groqChat(messages, temperature = 0.2) {
   const apiKey = process.env.GROQ_API_KEY;
 
   if (!apiKey) {
     throw new Error("Missing GROQ_API_KEY on the backend.");
   }
 
-  const response = await fetch(groqApiUrl, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: groqModel,
-      temperature: 0.2,
-      messages: [
-        {
-          role: "system",
-          content:
-            "You are a senior software architect. Return only raw JSON with no markdown fences. Build a practical starter project from the user's prompt. Include dependencies, folders, files, and concise starter code for each file. Never return a root folder like '/' or '.'.",
-        },
-        {
-          role: "user",
-          content:
-            `Create a project plan for this prompt:\n\n${prompt}\n\n` +
-            "Return exactly this JSON shape:\n" +
-            "{\n" +
-            '  "projectName": "string",\n' +
-            '  "summary": "string",\n' +
-            '  "dependencies": [\n' +
-            '    { "name": "string", "version": "string", "kind": "dependency|devDependency", "reason": "string" }\n' +
-            "  ],\n" +
-            '  "entries": [\n' +
-            '    { "path": "string", "type": "folder|file", "description": "string", "content": "string or null" }\n' +
-            "  ]\n" +
-            "}\n\n" +
-            "Rules:\n" +
-            "- Valid JSON only.\n" +
-            "- No markdown.\n" +
-            "- Folders must have content set to null.\n" +
-            "- Files must have code in content.\n" +
-            "- Keep the project reasonably small.\n" +
-            "- Prefer React + Vite for frontend prompts.\n",
-        },
-      ],
-    }),
-  });
+  let lastError;
 
-  if (!response.ok) {
+  for (let attempt = 0; attempt <= maxGroqRetries; attempt += 1) {
+    const response = await fetch(groqApiUrl, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: groqModel,
+        temperature,
+        input: buildResponsesInput(messages),
+      }),
+    });
+
+    if (response.ok) {
+      const data = await response.json();
+      const content = extractMessageText(data);
+
+      if (!content) {
+        throw new Error(
+          "Groq returned no usable text. Try again or use a shorter, more specific prompt."
+        );
+      }
+
+      return content;
+    }
+
     const errorText = await response.text();
-    throw new Error(`Groq request failed: ${response.status} ${errorText}`);
+    lastError = new Error(`Groq request failed: ${response.status} ${errorText}`);
+
+    if (response.status !== 429 || attempt === maxGroqRetries) {
+      throw lastError;
+    }
+
+    const retryAfterHeader = response.headers.get("retry-after");
+    const retryAfterSeconds = Number.parseFloat(retryAfterHeader || "");
+    const retryDelay = Number.isFinite(retryAfterSeconds)
+      ? Math.ceil(retryAfterSeconds * 1000)
+      : 1500 * (attempt + 1);
+
+    await sleep(retryDelay);
   }
 
-  const data = await response.json();
-  const content = data.choices?.[0]?.message?.content;
+  throw lastError || new Error("Groq request failed.");
+}
 
-  if (!content) {
-    throw new Error("Groq returned an empty response.");
-  }
+async function generateProjectStructure(prompt) {
+  const content = await groqChat(
+    [
+      {
+        role: "system",
+        content:
+          "You are a senior software architect. Return only raw JSON with no markdown fences. Build a practical starter project structure from the user's prompt. Include dependencies, folders, and file descriptions only. Never include file code here. Never return a root folder like '/' or '.'.",
+      },
+      {
+        role: "user",
+        content:
+          `Create a project structure for this prompt:\n\n${prompt}\n\n` +
+          "Return exactly this JSON shape:\n" +
+          "{\n" +
+          '  "projectName": "string",\n' +
+          '  "summary": "string",\n' +
+          '  "dependencies": [\n' +
+          '    { "name": "string", "version": "string", "kind": "dependency|devDependency", "reason": "string" }\n' +
+          "  ],\n" +
+          '  "entries": [\n' +
+          '    { "path": "string", "type": "folder|file", "description": "string", "content": null }\n' +
+          "  ]\n" +
+          "}\n\n" +
+          "Rules:\n" +
+          "- Valid JSON only.\n" +
+          "- No markdown.\n" +
+          "- Every entry content must be null in this structure response.\n" +
+          "- Include a small but complete starter project tree.\n" +
+          "- Prefer React + Vite for frontend prompts.\n",
+      },
+    ],
+    0.1
+  );
 
   return normalizeProjectPlan(parseGroqJson(content));
+}
+
+async function generateFileContent(prompt, structurePlan, fileEntry) {
+  const fileTree = structurePlan.entries.map((entry) => ({
+    path: entry.path,
+    type: entry.type,
+    description: entry.description,
+  }));
+
+  const content = await groqChat(
+    [
+      {
+        role: "system",
+        content:
+          "You are a senior software engineer. Generate the contents of exactly one file. Return only the raw file content. Do not wrap the answer in markdown fences. Do not explain anything.",
+      },
+      {
+        role: "user",
+        content:
+          `Project prompt:\n${prompt}\n\n` +
+          `Project name: ${structurePlan.projectName}\n` +
+          `Project summary: ${structurePlan.summary}\n\n` +
+          `Recommended dependencies:\n${JSON.stringify(structurePlan.dependencies, null, 2)}\n\n` +
+          `Project tree:\n${JSON.stringify(fileTree, null, 2)}\n\n` +
+          `Generate code for this file only:\n${JSON.stringify(
+            {
+              path: fileEntry.path,
+              description: fileEntry.description,
+            },
+            null,
+            2
+          )}\n\n` +
+          "Rules:\n" +
+          "- Return only the file content.\n" +
+          "- No markdown fences.\n" +
+          "- Make the file consistent with the rest of the project tree.\n" +
+          "- Keep the code concise but functional.\n",
+      },
+    ],
+    0.2
+  );
+
+  return content;
+}
+
+async function generateProjectPlan(prompt) {
+  const structurePlan = generateProjectStructure(prompt);
+  const resolvedStructure = await structurePlan;
+  const generatedEntries = [];
+
+  for (const entry of resolvedStructure.entries) {
+    if (entry.type === "folder") {
+      generatedEntries.push(entry);
+      continue;
+    }
+
+    const content = await generateFileContent(prompt, resolvedStructure, entry);
+    generatedEntries.push({
+      ...entry,
+      content,
+    });
+    await sleep(400);
+  }
+
+  return {
+    ...resolvedStructure,
+    entries: generatedEntries,
+  };
 }
 
 function isEnvMissing(error) {
@@ -188,6 +301,35 @@ function repairJsonString(input) {
   } catch {
     return "";
   }
+}
+
+function extractMessageText(data) {
+  if (typeof data.output_text === "string" && data.output_text.trim()) {
+    return data.output_text.trim();
+  }
+
+  const outputItems = Array.isArray(data.output) ? data.output : [];
+  const combined = outputItems
+    .flatMap((item) => (Array.isArray(item.content) ? item.content : []))
+    .map((item) => {
+      if (typeof item?.text === "string") {
+        return item.text;
+      }
+
+      if (typeof item?.value === "string") {
+        return item.value;
+      }
+
+      return "";
+    })
+    .join("")
+    .trim();
+
+  if (combined) {
+    return combined;
+  }
+
+  return "";
 }
 
 function normalizeProjectPlan(projectPlan) {
