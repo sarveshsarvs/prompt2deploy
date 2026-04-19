@@ -7,16 +7,61 @@ const initialForm = {
   password: "",
 };
 
-const sampleFiles = [
-  { name: "src/", type: "folder" },
-  { name: "App.jsx", type: "file", depth: 1 },
-  { name: "components/", type: "folder", depth: 1 },
-  { name: "PromptPanel.jsx", type: "file", depth: 2 },
-  { name: "OutputPreview.jsx", type: "file", depth: 2 },
-  { name: "public/", type: "folder" },
-  { name: "package.json", type: "file" },
-  { name: "README.md", type: "file" },
-];
+function normalizeEntries(entries) {
+  return [...entries]
+    .filter((entry) => entry.path && entry.path !== "/" && entry.path !== ".")
+    .sort((left, right) => {
+    const leftDepth = left.path.split("/").length;
+    const rightDepth = right.path.split("/").length;
+
+    if (leftDepth !== rightDepth) {
+      return leftDepth - rightDepth;
+    }
+
+    if (left.type !== right.type) {
+      return left.type === "folder" ? -1 : 1;
+    }
+
+    return left.path.localeCompare(right.path);
+    });
+}
+
+function getDepth(path) {
+  return path.split("/").length - 1;
+}
+
+function getLabel(path, type) {
+  const segments = path.split("/");
+  const name = segments[segments.length - 1];
+  return type === "folder" ? `${name}/` : name;
+}
+
+function getFileEntries(entries) {
+  return entries.filter((entry) => entry.type === "file");
+}
+
+function getLanguageFromPath(path) {
+  const extension = path.split(".").pop();
+
+  switch (extension) {
+    case "js":
+    case "jsx":
+      return "javascript";
+    case "ts":
+    case "tsx":
+      return "typescript";
+    case "css":
+      return "css";
+    case "html":
+      return "html";
+    case "json":
+      return "json";
+    case "md":
+      return "markdown";
+    default:
+      return "text";
+  }
+}
 
 function App() {
   const [mode, setMode] = useState("login");
@@ -26,6 +71,11 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [prompt, setPrompt] = useState("");
   const [user, setUser] = useState(null);
+  const [projectPlan, setProjectPlan] = useState(null);
+  const [generationError, setGenerationError] = useState("");
+  const [generationLoading, setGenerationLoading] = useState(false);
+  const [generatedWithModel, setGeneratedWithModel] = useState("");
+  const [selectedFilePath, setSelectedFilePath] = useState("");
 
   useEffect(() => {
     const savedUser = window.localStorage.getItem(storageKey);
@@ -85,11 +135,50 @@ function App() {
     window.localStorage.removeItem(storageKey);
     setUser(null);
     setPrompt("");
+    setProjectPlan(null);
+    setGenerationError("");
+    setGeneratedWithModel("");
+    setSelectedFilePath("");
     resetFeedback();
     setMode("login");
   };
 
+  const handleGenerate = async () => {
+    setGenerationError("");
+    setGenerationLoading(true);
+
+    try {
+      const response = await fetch("/api/generate", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ prompt }),
+      });
+
+      const payload = await response.json();
+
+      if (!response.ok) {
+        throw new Error(payload.message || "Unable to generate files.");
+      }
+
+      setProjectPlan(payload.projectPlan);
+      setGeneratedWithModel(payload.model);
+      const generatedFiles = getFileEntries(normalizeEntries(payload.projectPlan.entries));
+      setSelectedFilePath(generatedFiles[0]?.path || "");
+    } catch (generationRequestError) {
+      setGenerationError(generationRequestError.message);
+    } finally {
+      setGenerationLoading(false);
+    }
+  };
+
   if (user) {
+    const entries = projectPlan ? normalizeEntries(projectPlan.entries) : [];
+    const files = getFileEntries(entries);
+    const selectedFile =
+      files.find((item) => item.path === selectedFilePath) || files[0] || null;
+
     return (
       <main className="workspace-shell">
         <section className="workspace-topbar">
@@ -110,7 +199,9 @@ function App() {
                 <p className="eyebrow">Prompt input</p>
                 <h2>Describe the project you want to generate</h2>
               </div>
-              <span className="pill">Next step ready</span>
+              <span className="pill">
+                {projectPlan ? "Structure ready" : "Groq generator"}
+              </span>
             </div>
 
             <textarea
@@ -120,13 +211,23 @@ function App() {
               onChange={(event) => setPrompt(event.target.value)}
             />
 
+            {generationError ? (
+              <p className="feedback error">{generationError}</p>
+            ) : null}
+
             <div className="prompt-footer">
               <p>
-                Prompt collection is wired in now. File generation can be added on
-                top of this flow next.
+                Generate a structured starter project from your prompt and render
+                the planned folders, dependency list, and generated file code on
+                the right.
               </p>
-              <button className="primary-button" type="button">
-                Generate Files Later
+              <button
+                className="primary-button"
+                type="button"
+                onClick={handleGenerate}
+                disabled={generationLoading || !prompt.trim()}
+              >
+                {generationLoading ? "Generating..." : "Generate Files"}
               </button>
             </div>
           </div>
@@ -139,20 +240,102 @@ function App() {
               </div>
             </div>
 
-            <div className="file-tree">
-              {sampleFiles.map((item) => (
-                <div
-                  className={`file-row ${item.type}`}
-                  key={`${item.name}-${item.depth ?? 0}`}
-                  style={{ paddingLeft: `${(item.depth ?? 0) * 20 + 16}px` }}
-                >
-                  <span className="file-icon">
-                    {item.type === "folder" ? ">" : "-"}
-                  </span>
-                  <span>{item.name}</span>
+            {projectPlan ? (
+              <>
+                <div className="generated-meta">
+                  <strong>{projectPlan.projectName}</strong>
+                  <span>{projectPlan.summary}</span>
+                  {generatedWithModel ? (
+                    <span className="model-badge">{generatedWithModel}</span>
+                  ) : null}
                 </div>
-              ))}
-            </div>
+
+                <div className="dependency-card">
+                  <div className="dependency-header">
+                    <h3>Recommended packages</h3>
+                    <span>{projectPlan.dependencies.length} packages</span>
+                  </div>
+                  <div className="dependency-list">
+                    {projectPlan.dependencies.map((dependency) => (
+                      <div
+                        className="dependency-row"
+                        key={`${dependency.name}-${dependency.kind}`}
+                      >
+                        <div className="dependency-main">
+                          <strong>{dependency.name}</strong>
+                          <span>{dependency.version}</span>
+                        </div>
+                        <small>
+                          {dependency.kind} • {dependency.reason}
+                        </small>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="file-tree">
+                  {entries.map((item) => (
+                    <button
+                      className={`file-row ${item.type} ${selectedFile?.path === item.path ? "selected" : ""}`}
+                      key={`${item.path}-${item.type}`}
+                      style={{ paddingLeft: `${getDepth(item.path) * 20 + 16}px` }}
+                      type="button"
+                      onClick={() => {
+                        if (item.type === "file") {
+                          setSelectedFilePath(item.path);
+                        }
+                      }}
+                      disabled={item.type !== "file"}
+                    >
+                      <span className="file-icon">
+                        {item.type === "folder" ? ">" : "-"}
+                      </span>
+                      <div className="file-text">
+                        <span>{getLabel(item.path, item.type)}</span>
+                        <small>{item.description}</small>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+
+                <div className="code-panel">
+                  <div className="code-panel-header">
+                    <div>
+                      <p className="eyebrow">Generated code</p>
+                      <h3>{selectedFile ? selectedFile.path : "Select a file"}</h3>
+                    </div>
+                    {selectedFile ? (
+                      <span className="model-badge">
+                        {getLanguageFromPath(selectedFile.path)}
+                      </span>
+                    ) : null}
+                  </div>
+
+                  {selectedFile ? (
+                    <pre className="code-block">
+                      <code>{selectedFile.content || "// No content generated."}</code>
+                    </pre>
+                  ) : (
+                    <div className="empty-state compact">
+                      <p>
+                        Click any generated file to inspect the code content
+                        returned by Groq.
+                      </p>
+                    </div>
+                  )}
+                </div>
+              </>
+            ) : (
+              <div className="empty-state">
+                <p className="eyebrow">Waiting for prompt</p>
+                <h3>No generated structure yet</h3>
+                <p>
+                  Enter a prompt and click <strong>Generate Files</strong> to fill
+                  this panel with a proposed project tree, dependencies, and file
+                  code from Groq.
+                </p>
+              </div>
+            )}
           </div>
         </section>
       </main>
