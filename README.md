@@ -25,7 +25,7 @@ npm install
 ```bash
 AI_API_KEY=your-provider-api-key
 AI_MODEL=your-model-name
-AI_BASE_URL=https://openrouter.ai/api/v1/chat/completions
+AI_BASE_URL=https://openrouter.ai/api/v1/chat/completions  or https://api.groq.com/openai/v1
 ```
 
 3. Start the app:
